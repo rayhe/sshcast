@@ -1,0 +1,14 @@
+[Unit]
+Description=sshcast supervisor for %i
+Documentation=https://github.com/rayhe/sshcast
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/repos/sshcast/bin/sshcast daemon %i
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

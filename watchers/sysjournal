@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# sysjournal - example sshcast producer: streams the systemd journal as JSON.
+#
+# Install: copy to ~/.sshcast-watchers/ on the remote host and chmod +x.
+# Requires: systemd journal on the remote host. No --since support: the
+# journal is a live stream; use sshcast prune/read cursors locally instead.
+
+exec journalctl -f -o json --no-pager 2>/dev/null \
+    || exec journalctl -f --no-pager 2>/dev/null \
+    || { echo "sysjournal: no journal available" >&2; exit 1; }

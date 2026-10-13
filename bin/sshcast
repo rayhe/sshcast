@@ -1,0 +1,312 @@
+#!/usr/bin/env bash
+# sshcast - subscribe to remote event streams over one persistent SSH connection.
+#
+# Model: one multiplexed SSH connection per host (OpenSSH ControlMaster).
+# Each subscription is a long-lived remote command streaming newline-delimited
+# JSON to stdout. A local daemon keeps the connection and every subscription
+# alive. Readers consume per-topic append-only logs through byte cursors and
+# never touch the network, so reads are always instant and non-blocking.
+#
+# Dependencies: bash, openssh client, coreutils, python3. Optional: autossh.
+# No daemons to install on the remote side beyond the producer scripts.
+
+set -u
+
+VERSION="0.1.0"
+STATE_ROOT="${SSHCAST_STATE:-$HOME/.local/share/sshcast}"
+CONF_ROOT="${SSHCAST_CONF:-$HOME/.config/sshcast}"
+TOPICS_FILE="$CONF_ROOT/topics"          # lines: <host> <topic> <remote-command...>
+REMOTE_WATCHERS_DIR="${SSHCAST_REMOTE_WATCHERS_DIR:-.sshcast-watchers}"
+SSH_FLAGS="${SSHCAST_SSH_FLAGS:-}"  # extra flags for every ssh call, e.g. "-F /path/to/config"
+
+die() { echo "sshcast: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+
+# host -> filesystem-safe dir name
+safename() { printf '%s' "$1" | tr -c 'A-Za-z0-9._-' '_'; }
+
+host_state() { printf '%s/%s' "$STATE_ROOT" "$(safename "$1")"; }
+mux_sock()   { printf '%s/mux.ctl' "$(host_state "$1")"; }
+mux_pidf()   { printf '%s/mux.pid' "$(host_state "$1")"; }
+topic_log()  { printf '%s/topics/%s.ndjson' "$(host_state "$1")" "$(safename "$2")"; }
+topic_cur()  { printf '%s/topics/%s.cursor%s' "$(host_state "$1")" "$(safename "$2")" "${3:+.$(safename "$3")}"; }
+sub_want()   { printf '%s/subs/%s.want' "$(host_state "$1")" "$(safename "$2")"; }
+sub_pidf()   { printf '%s/subs/%s.pid' "$(host_state "$1")" "$(safename "$2")"; }
+
+ensure_host_dirs() {
+    mkdir -p "$(host_state "$1")/topics" "$(host_state "$1")/subs"
+}
+
+# --- mux -----------------------------------------------------------------
+
+mux_alive() {
+    local h="$1" s; s="$(mux_sock "$h")"
+    [ -S "$s" ] && ssh $SSH_FLAGS -S "$s" -O check "$h" >/dev/null 2>&1
+}
+
+# Start (or reuse) the persistent master connection for a host.
+cmd_up() {
+    local h="${1:?usage: sshcast up <host>}"
+    need ssh; ensure_host_dirs "$h"
+    if mux_alive "$h"; then echo "mux for $h already up"; return 0; fi
+    local sock; sock="$(mux_sock "$h")"
+    rm -f "$sock"
+    if command -v autossh >/dev/null 2>&1; then
+        AUTOSSH_PIDFILE="$(mux_pidf "$h")" AUTOSSH_GATETIME=0 \
+            autossh -M 0 -f -N -M 0 $SSH_FLAGS \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+            -o ControlMaster=yes -S "$sock" \
+            -o ControlPersist=no -o BatchMode=yes "$h"
+    else
+        ssh $SSH_FLAGS -fN -o ControlMaster=yes -S "$sock" -o ControlPersist=no \
+            -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+            -o BatchMode=yes "$h" || die "could not establish mux to $h"
+    fi
+    sleep 1
+    mux_alive "$h" && echo "mux up: $h" || die "mux failed for $h"
+}
+
+cmd_down() {
+    local h="${1:?usage: sshcast down <host>}"
+    # stop subscription channels first
+    for p in "$(host_state "$h")"/subs/*.pid; do
+        [ -f "$p" ] || continue
+        kill "$(cat "$p" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$p"
+    done
+    if mux_alive "$h"; then
+        ssh $SSH_FLAGS -S "$(mux_sock "$h")" -O exit "$h" 2>/dev/null || true
+    fi
+    rm -f "$(mux_sock "$h")"
+    echo "mux down: $h"
+}
+
+# --- topics ---------------------------------------------------------------
+
+# Look up the remote command for host+topic in the registry file.
+topic_cmd() {
+    local h="$1" t="$2"
+    [ -f "$TOPICS_FILE" ] || return 1
+    awk -v h="$h" -v t="$t" '$1==h && $2==t { $1=$2=""; sub(/^  */,""); print; exit }' "$TOPICS_FILE"
+}
+
+# Register intent to keep a subscription alive. The daemon actuates it.
+cmd_subscribe() {
+    local h="" t="" since=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --since) since="$2"; shift 2;;
+            *) [ -z "$h" ] && h="$1" || t="$1"; shift;;
+        esac
+    done
+    [ -n "$h" ] && [ -n "$t" ] || die "usage: sshcast subscribe <host> <topic> [--since <id>]"
+    need ssh; ensure_host_dirs "$h"
+    local cmd; cmd="$(topic_cmd "$h" "$t")" || die "no remote command registered for $h/$t (see sshcast topics, or add to $TOPICS_FILE)"
+    [ -n "$since" ] && cmd="$cmd --since $since"
+    printf '%s\n' "$cmd" > "$(sub_want "$h" "$t")"
+    touch "$(topic_log "$h" "$t")"
+    echo "subscribed: $h/$t (daemon will open the channel)"
+}
+
+cmd_unsubscribe() {
+    local h="${1:?usage: sshcast unsubscribe <host> <topic>}"
+    local t="${2:?usage: sshcast unsubscribe <host> <topic>}"
+    rm -f "$(sub_want "$h" "$t")"
+    local p; p="$(sub_pidf "$h" "$t")"
+    [ -f "$p" ] && kill "$(cat "$p" 2>/dev/null)" 2>/dev/null || true
+    rm -f "$p"
+    echo "unsubscribed: $h/$t (log retained)"
+}
+
+cmd_topics() {
+    local h="${1:?usage: sshcast topics <host>}"
+    echo "# local registry ($TOPICS_FILE):"
+    [ -f "$TOPICS_FILE" ] && while read -r rh rt rest; do
+        [ "$rh" = "$h" ] && printf '  %s -> %s\n' "$rt" "$rest"
+    done < "$TOPICS_FILE"
+    echo "# remote watchers ($REMOTE_WATCHERS_DIR on $h):"
+    cmd_up "$h" >/dev/null
+    ssh $SSH_FLAGS -S "$(mux_sock "$h")" -o BatchMode=yes "$h" \
+        "ls -1 '$REMOTE_WATCHERS_DIR' 2>/dev/null" | sed 's/^/  /' || true
+}
+
+# --- daemon ----------------------------------------------------------------
+# Foreground loop: keep mux up, keep one live channel per .want file.
+# Run under systemd (see systemd/sshcast@.service) or nohup.
+
+cmd_daemon() {
+    local h="${1:?usage: sshcast daemon <host>}"
+    need ssh; need setsid; ensure_host_dirs "$h"
+    # Portable single-instance lock (mkdir is atomic; no flock on macOS).
+    # Steals the lock if the recorded pid is dead (stale after kill -9).
+    local lockdir; lockdir="$(host_state "$h")/daemon.lock"
+    if ! mkdir "$lockdir" 2>/dev/null; then
+        local oldpid; oldpid="$(cat "$lockdir/pid" 2>/dev/null || echo 0)"
+        if [ "$oldpid" -gt 0 ] 2>/dev/null && kill -0 "$oldpid" 2>/dev/null; then
+            die "daemon already running for $h (pid $oldpid)"
+        fi
+        rm -rf "$lockdir"; mkdir "$lockdir" || die "cannot take daemon lock for $h"
+    fi
+    printf '%s' "$$" > "$lockdir/pid"
+    _SSHCAST_LOCKDIR="$lockdir"  # global: the EXIT trap fires after locals are gone
+    echo "sshcast daemon for $h (pid $$)"
+    trap 'rm -rf "$_SSHCAST_LOCKDIR"; exit 0' TERM INT EXIT
+    while true; do
+        if ! mux_alive "$h"; then
+            cmd_up "$h" >/dev/null 2>&1 || { sleep 10; continue; }
+        fi
+        for w in "$(host_state "$h")"/subs/*.want; do
+            [ -f "$w" ] || continue
+            local t; t="$(basename "$w" .want)"
+            local p; p="$(sub_pidf "$h" "$t")"
+            if [ -f "$p" ] && kill -0 "$(cat "$p" 2>/dev/null)" 2>/dev/null; then
+                continue
+            fi
+            local cmd log
+            cmd="$(cat "$w")"; log="$(topic_log "$h" "$t")"
+            # One channel per subscription, multiplexed over the single mux.
+            # stdout appends NDJSON to the topic log; stderr to a side log.
+            setsid ssh $SSH_FLAGS -S "$(mux_sock "$h")" -o BatchMode=yes \
+                -o ServerAliveInterval=30 -o ServerAliveCountMax=3 \
+                "$h" "$cmd" >>"$log" 2>>"$log.err" &
+            printf '%s' "$!" > "$p"
+        done
+        sleep 10
+    done
+}
+
+# --- read ------------------------------------------------------------------
+# Pure file I/O. Never touches the network: always instant, never blocks.
+
+cmd_read() {
+    need python3
+    local h="" t="" consumer="default" peek=0 follow=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --as) consumer="$2"; shift 2;;
+            --peek) peek=1; shift;;
+            --follow|-f) follow=1; shift;;
+            *) [ -z "$h" ] && h="$1" || t="$1"; shift;;
+        esac
+    done
+    [ -n "$h" ] && [ -n "$t" ] || die "usage: sshcast read <host> <topic> [--as <name>] [--peek] [--follow]"
+    local log cur
+    log="$(topic_log "$h" "$t")"; cur="$(topic_cur "$h" "$t" "$consumer")"
+    [ -f "$log" ] || die "no log for $h/$t (subscribe first)"
+    local off=0 size
+    [ -f "$cur" ] && off="$(cat "$cur" 2>/dev/null || echo 0)"
+    size="$(wc -c <"$log")"
+    # Log truncated/rotated under us: start over rather than seek past EOF.
+    [ "$off" -gt "$size" ] && off=0
+    if [ "$size" -gt "$off" ]; then
+        # Emit only complete lines; hold back a trailing partial line so a
+        # writer mid-line never yields truncated JSON. Cursor advances past
+        # complete lines only.
+        python3 - "$log" "$off" "$size" <<'EOF'
+import sys
+log, off, size = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(log, 'rb') as f:
+    f.seek(off)
+    data = f.read(size - off)
+head, sep, tail = data.rpartition(b'\n')
+if sep:
+    sys.stdout.buffer.write(head + sep)
+    print(off + len(head) + 1, end='')
+else:
+    print(off, end='')
+EOF
+    fi > /tmp/sshcast-read.$$ 2>/dev/null || true
+    # split helper output: body, then new cursor on last line
+    local newoff body
+    body="$(sed '$d' /tmp/sshcast-read.$$ 2>/dev/null)"
+    newoff="$(tail -n 1 /tmp/sshcast-read.$$ 2>/dev/null)"
+    rm -f /tmp/sshcast-read.$$
+    [ -n "$body" ] && printf '%s\n' "$body"
+    if [ "$peek" -eq 0 ] && [ -n "$newoff" ]; then
+        printf '%s' "$newoff" > "$cur"
+    fi
+    if [ "$follow" -eq 1 ]; then
+        # -f chosen explicitly by the user: blocking is their call.
+        tail -c +"$(( ${newoff:-$off} + 1 ))" -f "$log"
+    fi
+}
+
+cmd_prune() {
+    local h="${1:?usage: sshcast prune <host> <topic> [--keep N]}"
+    local t="${2:?usage: sshcast prune <host> <topic> [--keep N]}"
+    local keep=10000; [ "${3:-}" = "--keep" ] && keep="${4:-10000}"
+    local log; log="$(topic_log "$h" "$t")"
+    [ -f "$log" ] || die "no log for $h/$t"
+    tail -n "$keep" "$log" > "$log.tmp" && mv "$log.tmp" "$log"
+    # Any cursor past the new EOF self-heals on next read; still, clamp now.
+    local size; size="$(wc -c <"$log")"
+    for c in "$(host_state "$h")"/topics/"$(safename "$t")".cursor*; do
+        [ -f "$c" ] || continue
+        [ "$(cat "$c" 2>/dev/null || echo 0)" -gt "$size" ] && printf '%s' "$size" > "$c"
+    done
+    echo "pruned $h/$t to last $keep lines"
+}
+
+cmd_status() {
+    local h="${1:-}"
+    if [ -z "$h" ]; then
+        echo "hosts with state:"
+        for d in "$STATE_ROOT"/*/; do [ -d "$d" ] && basename "$d"; done 2>/dev/null
+        return 0
+    fi
+    ensure_host_dirs "$h"
+    if mux_alive "$h"; then echo "mux: UP ($h)"; else echo "mux: DOWN ($h)"; fi
+    echo "subscriptions:"
+    for w in "$(host_state "$h")"/subs/*.want; do
+        [ -f "$w" ] || continue
+        local t; t="$(basename "$w" .want)"
+        local p; p="$(sub_pidf "$h" "$t")"
+        if [ -f "$p" ] && kill -0 "$(cat "$p" 2>/dev/null)" 2>/dev/null; then
+            st="live (pid $(cat "$p"))"
+        else
+            st="wanted (no live channel)"
+        fi
+        local n; n="$(wc -l <"$(topic_log "$h" "$t")" 2>/dev/null || echo 0)"
+        printf '  %-20s %-28s %s events\n' "$t" "$st" "$n"
+    done
+}
+
+cmd_help() {
+    cat <<'EOF'
+sshcast - subscribe to remote event streams over one persistent SSH connection.
+
+  sshcast up <host>                        open the persistent mux connection
+  sshcast down <host>                      close it (and all channels)
+  sshcast topics <host>                    list local registry + remote watchers
+  sshcast subscribe <host> <topic> [--since <id>]
+                                           keep a subscription alive (daemon actuates)
+  sshcast unsubscribe <host> <topic>       stop it (log retained)
+  sshcast read <host> <topic> [--as <name>] [--peek] [--follow]
+                                           print new events; advances cursor (never blocks)
+  sshcast prune <host> <topic> [--keep N]  trim log to last N lines (default 10000)
+  sshcast daemon <host>                    foreground supervisor (use the systemd unit)
+  sshcast status [host]                    mux + subscription state
+
+Producer contract (remote scripts in ~/.sshcast-watchers/):
+  - print newline-delimited JSON, one event per line, to stdout
+  - recommended fields: {"id": "<monotonic>", "ts": "<iso8601>", ...}
+  - accept optional: --since <id>  (skip events at or before id)
+
+Local registry (~/.config/sshcast/topics), one per line:
+  <host> <topic> <remote-command...>
+
+Reads never touch the network. Cursors are byte offsets into the
+append-only per-topic log, one per consumer name (--as).
+
+Set SSHCAST_SSH_FLAGS for extra flags on every ssh call
+(e.g. SSHCAST_SSH_FLAGS="-F ~/.ssh/other_config").
+SSHCAST_STATE and SSHCAST_CONF override the state/config roots.
+EOF
+}
+
+case "${1:-help}" in
+    up|down|topics|subscribe|unsubscribe|read|prune|daemon|status) cmd="$1"; shift; "cmd_$cmd" "$@";;
+    --version|-V) echo "sshcast $VERSION";;
+    help|--help|-h|"") cmd_help;;
+    *) die "unknown command: $1 (see sshcast help)";;
+esac

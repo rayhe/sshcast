@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# filewatch - example sshcast producer: emits a JSON event whenever lines are
+# appended to a file. Usage: filewatch <path> [--since <id>]
+#
+# Install: copy to ~/.sshcast-watchers/ on the remote host and chmod +x.
+
+FILE="${1:?usage: filewatch <path> [--since <id>]}"
+[ -f "$FILE" ] || { echo "filewatch: not found: $FILE" >&2; exit 1; }
+
+# tail -F survives rotation and truncation; --pid=$$ is unnecessary here
+# because ssh tearing down the channel kills the process group.
+tail -n 0 -F "$FILE" 2>/dev/null | while IFS= read -r line; do
+    # minimal JSON string escaping for the log line
+    esc=$(printf '%s' "$line" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+    printf '{"id":"%s","ts":"%s","type":"filewatch","file":"%s","line":%s}\n' \
+        "$(date +%s%N)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$FILE" "$esc"
+done

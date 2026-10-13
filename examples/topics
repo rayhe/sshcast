@@ -1,0 +1,8 @@
+# sshcast topic registry: <host> <topic> <remote-command...>
+# Copy to ~/.config/sshcast/topics and edit. <host> is any ssh host alias
+# (from ~/.ssh/config) or user@hostname. The remote command must print
+# newline-delimited JSON to stdout and ideally accept --since <id>.
+
+# jump heartbeat   .sshcast-watchers/heartbeat --interval 5
+# jump sysjournal  .sshcast-watchers/sysjournal
+# jump deploylog   .sshcast-watchers/filewatch /var/log/deploy.log
